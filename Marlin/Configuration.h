@@ -1801,6 +1801,7 @@
  *  - Use a low value (i.e., Z_MIN_POS) if the nozzle falls down to the bed.
  *  - Use a large value (i.e., Z_MAX_POS) if the bed falls down, away from the nozzle.
  */
+//#define Z_IDLE_HEIGHT Z_HOME_POfS
 
 #define Z_CLEARANCE_FOR_HOMING  5   // (mm) Minimal Z height before homing (G28) for Z clearance above the bed, clamps, ...
                                       // You'll need this much clearance above Z_MAX_POS to avoid grinding.
@@ -2422,7 +2423,6 @@
 //
 #define PREHEAT_1_LABEL       "PLA"
 #define PREHEAT_1_TEMP_HOTEND 210
-#define PREHEAT_1_TEMP_BED     65
 #define PREHEAT_1_TEMP_BED     60
 #define PREHEAT_1_TEMP_CHAMBER 35
 #define PREHEAT_1_FAN_SPEED     0 // Value from 0 to 255
