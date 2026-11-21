@@ -37,6 +37,9 @@
 
 #include "../gcode/gcode.h"
 #include "../lcd/marlinui.h"
+#if ENABLED(CREALITY_RTS)
+  #include "../lcd/rts/lcd_rts.h"
+#endif
 
 #if HAS_LEVELING
   #include "../feature/bedlevel/bedlevel.h"
@@ -68,6 +71,10 @@
   #endif
 #endif
 
+#if ENABLED(PROBING_USE_CURRENT_HOME)
+  #include "../feature/tmc_util.h"
+#endif
+
 #if ENABLED(MEASURE_BACKLASH_WHEN_PROBING)
   #include "../feature/backlash.h"
 #endif
@@ -80,7 +87,7 @@
   #include "../feature/host_actions.h" // for PROMPT_USER_CONTINUE
 #endif
 
-#if HAS_Z_SERVO_PROBE || HAS_MAG_MOUNTED_SERVO_PROBE
+#if ANY(HAS_Z_SERVO_PROBE, HAS_MAG_MOUNTED_SERVO_PROBE, SWITCHING_NOZZLE_LIFT_TO_PROBE)
   #include "servo.h"
 #endif
 
@@ -132,7 +139,9 @@ xyz_pos_t Probe::offset; // Initialized by settings.load
     motion.blocking_move_x(X_MAX_POS + SLED_DOCKING_OFFSET - ((stow) ? 1 : 0));
 
     #if HAS_SOLENOID_1 && DISABLED(EXT_SOLENOID)
+      if (stow) endstops.enable_z_probe(false);
       WRITE(SOL1_PIN, !stow); // switch solenoid
+      if (!stow) safe_delay(500);
     #endif
   }
 
@@ -351,7 +360,7 @@ xyz_pos_t Probe::offset; // Initialized by settings.load
    */
   void Probe::set_devices_paused_for_probing(const bool dopause) {
     TERN_(PROBING_HEATERS_OFF, thermalManager.pause_heaters(dopause));
-    TERN_(PROBING_FANS_OFF, thermalManager.set_fans_paused(dopause));
+    TERN_(PROBING_FANS_OFF, Fan::all_pause(dopause));
     TERN_(PROBING_ESTEPPERS_OFF, if (dopause) stepper.disable_e_steppers());
     #if ENABLED(PROBING_STEPPERS_OFF)
       static main_axes_bits_t old_trusted;
@@ -376,7 +385,7 @@ FORCE_INLINE void probe_specific_action(const bool deploy) {
   #if ENABLED(PAUSE_BEFORE_DEPLOY_STOW)
 
     // Start preheating before waiting for user confirmation that the probe is ready.
-    TERN_(PREHEAT_BEFORE_PROBING, if (deploy) probe.preheat_for_probing(PROBING_NOZZLE_TEMP, PROBING_BED_TEMP, true));
+    TERN_(PREHEAT_BEFORE_PROBING, if (deploy) thermalManager.preheat_for_probing(true));
 
     FSTR_P const ds_fstr = deploy ? GET_TEXT_F(MSG_MANUAL_DEPLOY) : GET_TEXT_F(MSG_MANUAL_STOW);
     ui.return_to_status();       // To display the new status message
@@ -417,7 +426,9 @@ FORCE_INLINE void probe_specific_action(const bool deploy) {
   #if ENABLED(SOLENOID_PROBE)
 
     #if HAS_SOLENOID_1
+      if (!deploy) endstops.enable_z_probe(false);
       WRITE(SOL1_PIN, deploy);
+      if (deploy) safe_delay(500);
     #endif
 
   #elif ENABLED(MAGLEV4)
@@ -458,61 +469,6 @@ FORCE_INLINE void probe_specific_action(const bool deploy) {
 
   #endif
 }
-
-#if ANY(PREHEAT_BEFORE_PROBING, PREHEAT_BEFORE_LEVELING)
-
-  #if ENABLED(PREHEAT_BEFORE_PROBING)
-    #ifndef PROBING_NOZZLE_TEMP
-      #define PROBING_NOZZLE_TEMP 0
-    #endif
-    #ifndef PROBING_BED_TEMP
-      #define PROBING_BED_TEMP 0
-    #endif
-  #endif
-
-  /**
-   * Do preheating as required before leveling or probing.
-   *  - If a preheat input is higher than the current target, raise the target temperature.
-   *  - If a preheat input is higher than the current temperature, wait for stabilization.
-   */
-  void Probe::preheat_for_probing(const celsius_t hotend_temp, const celsius_t bed_temp, const bool early/*=false*/) {
-    #if HAS_HOTEND && (PROBING_NOZZLE_TEMP || LEVELING_NOZZLE_TEMP)
-      #define WAIT_FOR_NOZZLE_HEAT
-    #endif
-    #if HAS_HEATED_BED && (PROBING_BED_TEMP || LEVELING_BED_TEMP)
-      #define WAIT_FOR_BED_HEAT
-    #endif
-
-    if (!early) LCD_MESSAGE(MSG_PREHEATING);
-
-    DEBUG_ECHOPGM("Preheating ");
-
-    #if ENABLED(WAIT_FOR_NOZZLE_HEAT)
-      const celsius_t hotendPreheat = hotend_temp > thermalManager.degTargetHotend(0) ? hotend_temp : 0;
-      if (hotendPreheat) {
-        DEBUG_ECHOPGM("hotend (", hotendPreheat, ")");
-        thermalManager.setTargetHotend(hotendPreheat, 0);
-      }
-    #endif
-
-    #if ENABLED(WAIT_FOR_BED_HEAT)
-      const celsius_t bedPreheat = bed_temp > thermalManager.degTargetBed() ? bed_temp : 0;
-      if (bedPreheat) {
-        if (TERN0(WAIT_FOR_NOZZLE_HEAT, hotendPreheat)) DEBUG_ECHOPGM(" and ");
-        DEBUG_ECHOPGM("bed (", bedPreheat, ")");
-        thermalManager.setTargetBed(bedPreheat);
-      }
-    #endif
-
-    DEBUG_EOL();
-
-    if (!early) {
-      TERN_(WAIT_FOR_NOZZLE_HEAT, if (hotend_temp > thermalManager.wholeDegHotend(0) + (TEMP_WINDOW)) thermalManager.wait_for_hotend(0));
-      TERN_(WAIT_FOR_BED_HEAT,    if (bed_temp    > thermalManager.wholeDegBed() + (TEMP_BED_WINDOW)) thermalManager.wait_for_bed_heating());
-    }
-  }
-
-#endif
 
 /**
  * Print an error and stop()
@@ -592,7 +548,7 @@ bool Probe::set_deployed(const bool deploy, const bool no_return/*=false*/) {
 
   // If preheating is required before any probing...
   // TODO: Consider skipping this for things like M401, G34, etc.
-  TERN_(PREHEAT_BEFORE_PROBING, if (deploy) preheat_for_probing(PROBING_NOZZLE_TEMP, PROBING_BED_TEMP));
+  TERN_(PREHEAT_BEFORE_PROBING, if (deploy) thermalManager.preheat_for_probing());
 
   if (!no_return) motion.blocking_move(old_xy); // Return to the original location unless handled externally
 
@@ -636,6 +592,12 @@ bool Probe::probe_down_to_z(const float z, const feedRate_t fr_mm_s) {
 
   #if HAS_Z_SERVO_PROBE && (ENABLED(Z_SERVO_INTERMEDIATE_STOW) || defined(Z_SERVO_MEASURE_ANGLE))
     probe_specific_action(true);  // Always re-deploy in this case
+  #endif
+  #if ENABLED(SOLENOID_PROBE)
+    if (deploy()) {
+      endstops.not_homing();
+      return true;
+    }
   #endif
 
   // Disable stealthChop if used. Enable diag1 pin on driver.
@@ -710,7 +672,7 @@ bool Probe::probe_down_to_z(const float z, const feedRate_t fr_mm_s) {
       return true; // Stow in LOW SPEED MODE on every trigger
   #endif
 
-  #if ALL(HAS_Z_SERVO_PROBE, Z_SERVO_INTERMEDIATE_STOW)
+  #if ENABLED(SOLENOID_PROBE) || ALL(HAS_Z_SERVO_PROBE, Z_SERVO_INTERMEDIATE_STOW)
     probe_specific_action(false);  //  Always stow
   #endif
 
@@ -793,8 +755,8 @@ float Probe::run_z_probe(const bool sanity_check/*=true*/, const float z_min_poi
     if (TERN0(PROBE_TARE, tare())) return true;
 
     // Do a first probe at the fast speed
-    const bool probe_fail = probe_down_to_z(z_probe_low_point, fr_mm_s),              // No probe trigger?
-               early_fail = (scheck && motion.position.z > zoffs + error_tolerance);  // Probe triggered too high?
+    const bool probe_fail = probe_down_to_z(z_probe_low_point, fr_mm_s),                               // No probe trigger?
+               early_fail = (!probe_fail && scheck && motion.position.z > (zoffs + error_tolerance));  // Probe triggered too high?
     #if ENABLED(DEBUG_LEVELING_FEATURE)
       if (DEBUGGING(LEVELING) && (probe_fail || early_fail)) {
         DEBUG_ECHOPGM(" Probe fail! - ");
@@ -809,7 +771,7 @@ float Probe::run_z_probe(const bool sanity_check/*=true*/, const float z_min_poi
 
   // Stop the probe before it goes too low to prevent damage.
   // For known Z probe below the expected trigger point, otherwise -10mm lower.
-  const float z_probe_low_point = zoffs + z_min_point -float((!motion.axis_is_trusted(Z_AXIS)) * 10);
+  const float z_probe_low_point = zoffs + z_min_point - float((!motion.axis_is_trusted(Z_AXIS)) * 10);
   if (DEBUGGING(LEVELING)) DEBUG_ECHOLNPGM("Probe Low Point: ", z_probe_low_point);
 
   #if DISABLED(DWIN_LCD_PROUI)
@@ -1049,8 +1011,8 @@ float Probe::probe_at_point(
   // Move the probe to the starting XYZ
   motion.blocking_move(npos, feedRate_t(XY_PROBE_FEEDRATE_MM_S));
 
-  // Change Z motor current to homing current
-  TERN_(PROBING_USE_CURRENT_HOME, motion.set_homing_current(Z_AXIS));
+  // Use the Z homing current until this function returns
+  TERN_(PROBING_USE_CURRENT_HOME, const TemporaryHomingCurrent temp_current(Z_AXIS));
 
   float measured_z;
 
@@ -1095,6 +1057,7 @@ float Probe::probe_at_point(
       // The user may want to quickly move the carriage or bed by hand to avoid bed damage from the (hot) nozzle.
       // This would also benefit from the contemplated "Audio Alerts" feature.
       stow();
+      TERN_(CREALITY_RTS, RTS_ProbingFailed());
       LCD_MESSAGE(MSG_LCD_PROBING_FAILED);
       #if DISABLED(G29_RETRY_AND_RECOVER)
         SERIAL_ERROR_MSG(STR_ERR_PROBING_FAILED);
@@ -1108,9 +1071,6 @@ float Probe::probe_at_point(
     }
 
   #endif // !BD_SENSOR
-
-  // Restore the Z homing current
-  TERN_(PROBING_USE_CURRENT_HOME, motion.restore_homing_current(Z_AXIS));
 
   return measured_z;
 }
